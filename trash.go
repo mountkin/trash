@@ -72,6 +72,11 @@ func main() {
 			Hidden: true,
 			EnvVar: "GOPATH",
 		},
+		cli.StringSliceFlag{
+			Name:  "skip-tag",
+			Usage: "Skip looking for imports in files with any of these build tags (flag can be used multiple times)",
+			// Consider the breaking change of defaulting to ["ignore"]
+		},
 	}
 	app.Action = run
 
@@ -93,6 +98,7 @@ func run(c *cli.Context) error {
 	insecure := c.Bool("insecure")
 	trashDir := c.String("cache")
 	gopath = c.String("gopath")
+	buildtagfilters := c.StringSlice("skip-tag")
 
 	trashDir, err := filepath.Abs(trashDir)
 	if err != nil {
@@ -132,7 +138,7 @@ func run(c *cli.Context) error {
 	}
 
 	if update {
-		return updateTrash(trashDir, dir, targetDir, confFile, trashConf, insecure)
+		return updateTrash(trashDir, dir, targetDir, confFile, trashConf, insecure, buildtagfilters)
 	}
 
 	if err := vendor(keep, trashDir, dir, targetDir, trashConf, insecure); err != nil {
@@ -202,10 +208,10 @@ func run(c *cli.Context) error {
 	if keep {
 		return nil
 	}
-	return cleanup(dir, targetDir, trashConf)
+	return cleanup(dir, targetDir, trashConf, buildtagfilters)
 }
 
-func updateTrash(trashDir, dir, targetDir, trashFile string, trashConf *conf.Conf, insecure bool) error {
+func updateTrash(trashDir, dir, targetDir, trashFile string, trashConf *conf.Conf, insecure bool, buildtagfilters []string) error {
 	// TODO collect imports, create `trashConf *conf.Trash`
 	rootPackage := trashConf.Package
 	if rootPackage == "" {
@@ -219,7 +225,7 @@ func updateTrash(trashDir, dir, targetDir, trashFile string, trashConf *conf.Con
 	importsLen := 0
 
 	os.Chdir(dir)
-	imports := collectImports(rootPackage, libRoot, targetDir)
+	imports := collectImports(rootPackage, libRoot, targetDir, buildtagfilters)
 	for len(imports) > importsLen {
 		importsLen = len(imports)
 		for pkg := range imports {
@@ -235,7 +241,7 @@ func updateTrash(trashDir, dir, targetDir, trashFile string, trashConf *conf.Con
 			checkout(trashDir, i)
 		}
 		os.Chdir(dir)
-		imports = collectImports(rootPackage, libRoot, targetDir)
+		imports = collectImports(rootPackage, libRoot, targetDir, buildtagfilters)
 	}
 
 	trashConf.Package = rootPackage // Overwrite possibly non existent root package name
@@ -526,7 +532,7 @@ func parentPackages(root, p string) util.Packages {
 	return r
 }
 
-func listImports(rootPackage, libRoot, pkg string) <-chan util.Packages {
+func listImports(rootPackage, libRoot, pkg string, buildtagfilters []string) <-chan util.Packages {
 	pkgPath := "."
 	if pkg != rootPackage {
 		if strings.HasPrefix(pkg, rootPackage+"/") {
@@ -547,7 +553,7 @@ func listImports(rootPackage, libRoot, pkg string) <-chan util.Packages {
 		defer close(sch)
 
 		// Gather all the Go imports
-		ps, err := parser.ParseDir(token.NewFileSet(), pkgPath, noVendoredTests, parser.ImportsOnly)
+		ps, err := parser.ParseDir(token.NewFileSet(), pkgPath, noVendoredTests, parser.ParseComments|parser.ImportsOnly)
 		if err != nil {
 			if os.IsNotExist(err) {
 				logrus.Debugf("listImports, pkgPath does not exist: %s", err)
@@ -559,6 +565,9 @@ func listImports(rootPackage, libRoot, pkg string) <-chan util.Packages {
 		logrus.Infof("Collecting imports for package '%s'", pkg)
 		for _, p := range ps {
 			for _, f := range p.Files {
+				if hasFilteredBuildTag(f, buildtagfilters) {
+					continue
+				}
 				for _, v := range f.Imports {
 					imp := v.Path.Value[1 : len(v.Path.Value)-1]
 					if pkgComponents := strings.Split(imp, "/"); !strings.Contains(pkgComponents[0], ".") {
@@ -623,6 +632,41 @@ func listImports(rootPackage, libRoot, pkg string) <-chan util.Packages {
 	return chanPackagesFromLines(lnc)
 }
 
+func hasFilteredBuildTag(f *ast.File, filtered []string) bool {
+	if len(f.Comments) == 0 {
+		// No build tags if no comments!
+		return false
+	}
+	block := f.Comments[0]
+	if block.Pos() > f.Package {
+		// Ignore import comments
+		return false
+	}
+	if block == f.Doc {
+		// Build tags cannot be in the package documentation
+		return false
+	}
+
+	// Loop through comment lines, searching for build tags
+	for _, line := range block.List {
+		comment := strings.TrimSpace(line.Text[2:])
+		if strings.HasPrefix(comment, "+build") {
+			tagline := strings.TrimSpace(strings.TrimPrefix(comment, "+build"))
+			groups := strings.Split(tagline, " ")
+			for _, grp := range groups {
+				for _, tag := range strings.Split(grp, ",") {
+					for _, filter := range filtered {
+						if tag == filter {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 func chanPackagesFromLines(lnc <-chan string) <-chan util.Packages {
 	return util.ChanPackages(func() util.Packages {
 		r := util.Packages{}
@@ -667,7 +711,7 @@ func listPackages(rootPackage, targetDir string) util.Packages {
 	return r
 }
 
-func collectImports(rootPackage, libRoot, targetDir string) util.Packages {
+func collectImports(rootPackage, libRoot, targetDir string, buildtagfilters []string) util.Packages {
 	logrus.Infof("Collecting packages in '%s'", rootPackage)
 
 	imports := util.Packages{}
@@ -677,7 +721,7 @@ func collectImports(rootPackage, libRoot, targetDir string) util.Packages {
 	for len(packages) > 0 {
 		cs := []<-chan util.Packages{}
 		for p := range packages {
-			cs = append(cs, listImports(rootPackage, libRoot, p))
+			cs = append(cs, listImports(rootPackage, libRoot, p, buildtagfilters))
 		}
 		for ps := range util.MergePackagesChans(cs...) {
 			imports.Merge(ps)
@@ -829,7 +873,7 @@ func guessRootPackage(dir string) string {
 	return dir[len(srcPath+"/"):]
 }
 
-func cleanup(dir, targetDir string, trashConf *conf.Conf) error {
+func cleanup(dir, targetDir string, trashConf *conf.Conf, buildtagfilters []string) error {
 	rootPackage := trashConf.Package
 	if rootPackage == "" {
 		rootPackage = guessRootPackage(dir)
@@ -839,7 +883,7 @@ func cleanup(dir, targetDir string, trashConf *conf.Conf) error {
 
 	os.Chdir(dir)
 
-	imports := collectImports(rootPackage, targetDir, targetDir)
+	imports := collectImports(rootPackage, targetDir, targetDir, buildtagfilters)
 	if err := removeExcludes(trashConf.Excludes, targetDir); err != nil {
 		logrus.Errorf("Error removing excluded dirs: %v", err)
 	}
