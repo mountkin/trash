@@ -51,8 +51,11 @@ func CmdOutLines(cmd *exec.Cmd) <-chan string {
 func MergePackagesChans(cs ...<-chan Packages) <-chan Packages {
 	out := make(chan Packages)
 	wg := sync.WaitGroup{}
-	wg.Add(len(cs))
 	for _, c := range cs {
+		if c == nil {
+			continue
+		}
+		wg.Add(1)
 		go func(c <-chan Packages) {
 			defer wg.Done()
 			for s := range c {

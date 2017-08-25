@@ -27,14 +27,9 @@ var Version string = "v0.3.0-dev"
 func main() {
 	app := cli.NewApp()
 	app.Version = Version
-	app.Author = "@imikushin, @ibuildthecloud"
+	app.Author = "@imikushin, @ibuildthecloud, @mountkin"
 	app.Usage = "Vendor imported packages and throw away the trash!"
 	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:  "file, f",
-			Value: "vendor.conf",
-			Usage: "Vendored packages list",
-		},
 		cli.StringFlag{
 			Name:  "directory, C",
 			Value: ".",
@@ -72,15 +67,6 @@ func main() {
 			Hidden: true,
 			EnvVar: "GOPATH",
 		},
-		cli.StringSliceFlag{
-			Name:  "skip-tag",
-			Usage: "Skip looking for imports in files with any of these build tags (flag can be used multiple times)",
-			Value: &cli.StringSlice{"ignore"},
-		},
-		cli.BoolFlag{
-			Name:  "native-only",
-			Usage: "Only analyse the native GOOS and GOARCH files when gathering the imported files",
-		},
 	}
 	app.Action = run
 
@@ -96,14 +82,12 @@ func run(c *cli.Context) error {
 
 	dir := c.String("directory")
 	targetDir := c.String("target")
-	confFile := c.String("file")
+	confFile := "vendor.yaml"
 	keep := c.Bool("keep")
 	update := c.Bool("update")
 	insecure := c.Bool("insecure")
 	trashDir := c.String("cache")
 	gopath = c.String("gopath")
-	buildtagfilters := c.StringSlice("skip-tag")
-	nativeOnly := c.Bool("native-only")
 
 	trashDir, err := filepath.Abs(trashDir)
 	if err != nil {
@@ -119,31 +103,13 @@ func run(c *cli.Context) error {
 	}
 	logrus.Debugf("dir: '%s'", dir)
 
-	for _, confFile = range []string{confFile, "trash.conf", "vndr.cfg", "vendor.manifest", "trash.yml", "glide.yaml", "glide.yml", "trash.yaml"} {
-		if _, err = os.Stat(confFile); err == nil {
-			break
-		}
-	}
-	if err != nil {
-		if os.IsNotExist(err) && update {
-			confFile = c.String("file")
-			logrus.Warnf("Trash! '%s' not found, creating a new one!", confFile)
-			if _, err = os.Create(confFile); err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
-	}
-	logrus.Infof("Trash! Reading file: '%s'", confFile)
-
 	trashConf, err := conf.Parse(confFile)
 	if err != nil {
 		return err
 	}
 
 	if update {
-		return updateTrash(trashDir, dir, targetDir, confFile, trashConf, insecure, buildtagfilters, nativeOnly)
+		return updateTrash(trashDir, dir, targetDir, confFile, trashConf, insecure)
 	}
 
 	if err := vendor(keep, trashDir, dir, targetDir, trashConf, insecure); err != nil {
@@ -213,15 +179,16 @@ func run(c *cli.Context) error {
 	if keep {
 		return nil
 	}
-	return cleanup(dir, targetDir, trashConf, buildtagfilters, nativeOnly)
+	return cleanup(dir, targetDir, trashConf)
 }
 
-func updateTrash(trashDir, dir, targetDir, trashFile string, trashConf *conf.Conf, insecure bool, buildtagfilters []string, nativeOnly bool) error {
+func updateTrash(trashDir, dir, targetDir, trashFile string, trashConf *conf.Conf, insecure bool) error {
 	// TODO collect imports, create `trashConf *conf.Trash`
 	rootPackage := trashConf.Package
 	if rootPackage == "" {
 		rootPackage = guessRootPackage(dir)
 	}
+	rootPackage = strings.Trim(rootPackage, "/")
 
 	os.MkdirAll(filepath.Join(trashDir, "src"), 0755)
 	os.Setenv("GOPATH", trashDir)
@@ -230,7 +197,7 @@ func updateTrash(trashDir, dir, targetDir, trashFile string, trashConf *conf.Con
 	importsLen := 0
 
 	os.Chdir(dir)
-	imports := collectImports(rootPackage, libRoot, targetDir, buildtagfilters, nativeOnly)
+	imports := collectImports(rootPackage, libRoot, targetDir, trashConf)
 	for len(imports) > importsLen {
 		importsLen = len(imports)
 		for pkg := range imports {
@@ -246,7 +213,7 @@ func updateTrash(trashDir, dir, targetDir, trashFile string, trashConf *conf.Con
 			checkout(trashDir, i)
 		}
 		os.Chdir(dir)
-		imports = collectImports(rootPackage, libRoot, targetDir, buildtagfilters, nativeOnly)
+		imports = collectImports(rootPackage, libRoot, targetDir, trashConf)
 	}
 
 	trashConf.Package = rootPackage // Overwrite possibly non existent root package name
@@ -556,7 +523,7 @@ func init() {
 	}
 }
 
-func listImports(rootPackage, libRoot, pkg string, buildtagfilters []string, nativeOnly bool) <-chan util.Packages {
+func listImports(rootPackage, libRoot, pkg string, cfg *conf.Conf) <-chan util.Packages {
 	pkgPath := "."
 	if pkg != rootPackage {
 		if strings.HasPrefix(pkg, rootPackage+"/") {
@@ -565,6 +532,13 @@ func listImports(rootPackage, libRoot, pkg string, buildtagfilters []string, nat
 			pkgPath = libRoot + "/" + pkg
 		}
 	}
+
+	for _, ignored := range cfg.IgnoredPkgs {
+		if rootPackage+"/"+ignored == pkg {
+			return nil
+		}
+	}
+
 	logrus.Debugf("listImports, pkgPath: '%s'", pkgPath)
 	sch := make(chan string)
 
@@ -572,7 +546,7 @@ func listImports(rootPackage, libRoot, pkg string, buildtagfilters []string, nat
 		if strings.HasPrefix(pkgPath, libRoot+"/") && strings.HasSuffix(info.Name(), "_test.go") {
 			return false
 		}
-		if !nativeOnly {
+		if !cfg.NativeOnly {
 			return true
 		}
 
@@ -620,7 +594,7 @@ func listImports(rootPackage, libRoot, pkg string, buildtagfilters []string, nat
 			}
 
 			for _, f := range p.Files {
-				if hasFilteredBuildTag(f, buildtagfilters) {
+				if hasFilteredBuildTag(f, cfg.IgnoredTags) {
 					continue
 				}
 				for _, v := range f.Imports {
@@ -766,7 +740,7 @@ func listPackages(rootPackage, targetDir string) util.Packages {
 	return r
 }
 
-func collectImports(rootPackage, libRoot, targetDir string, buildtagfilters []string, nativeOnly bool) util.Packages {
+func collectImports(rootPackage, libRoot, targetDir string, cfg *conf.Conf) util.Packages {
 	logrus.Infof("Collecting packages in '%s'", rootPackage)
 
 	imports := util.Packages{}
@@ -776,7 +750,7 @@ func collectImports(rootPackage, libRoot, targetDir string, buildtagfilters []st
 	for len(packages) > 0 {
 		cs := []<-chan util.Packages{}
 		for p := range packages {
-			cs = append(cs, listImports(rootPackage, libRoot, p, buildtagfilters, nativeOnly))
+			cs = append(cs, listImports(rootPackage, libRoot, p, cfg))
 		}
 		for ps := range util.MergePackagesChans(cs...) {
 			imports.Merge(ps)
@@ -928,7 +902,7 @@ func guessRootPackage(dir string) string {
 	return dir[len(srcPath+"/"):]
 }
 
-func cleanup(dir, targetDir string, trashConf *conf.Conf, buildtagfilters []string, nativeOnly bool) error {
+func cleanup(dir, targetDir string, trashConf *conf.Conf) error {
 	rootPackage := trashConf.Package
 	if rootPackage == "" {
 		rootPackage = guessRootPackage(dir)
@@ -938,7 +912,7 @@ func cleanup(dir, targetDir string, trashConf *conf.Conf, buildtagfilters []stri
 
 	os.Chdir(dir)
 
-	imports := collectImports(rootPackage, targetDir, targetDir, buildtagfilters, nativeOnly)
+	imports := collectImports(rootPackage, targetDir, targetDir, trashConf)
 	if err := removeExcludes(trashConf.Excludes, targetDir); err != nil {
 		logrus.Errorf("Error removing excluded dirs: %v", err)
 	}

@@ -1,8 +1,7 @@
 package conf
 
 import (
-	"bufio"
-	"fmt"
+	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
@@ -12,12 +11,15 @@ import (
 )
 
 type Conf struct {
-	Package   string   `yaml:"package,omitempty"`
-	Imports   []Import `yaml:"import,omitempty"`
-	Excludes  []string `yaml:"exclude,omitempty"`
-	importMap map[string]Import
-	confFile  string
-	yamlType  bool
+	Package     string   `yaml:"package,omitempty"`
+	Imports     []Import `yaml:"import,omitempty"`
+	Excludes    []string `yaml:"exclude,omitempty"`
+	IgnoredTags []string `yaml:"ignored_tags,omitempty"`
+	IgnoredPkgs []string `yaml:"ignored_pkgs,omitempty"`
+	NativeOnly  bool     `yaml:"native_only,omitempty"`
+	importMap   map[string]Import
+	confFile    string
+	yamlType    bool
 }
 
 type Import struct {
@@ -40,79 +42,36 @@ func Parse(path string) (*Conf, error) {
 	defer file.Close()
 
 	trashConf := &Conf{confFile: path}
-	if yaml.NewDecoder(file).Decode(trashConf) == nil {
-		trashConf.yamlType = true
-		trashConf.Dedupe()
-		return trashConf, nil
-	}
-
-	trashConf = &Conf{confFile: path}
-	_, err = file.Seek(0, 0)
+	err = yaml.NewDecoder(file).Decode(trashConf)
 	if err != nil {
 		return nil, err
 	}
 
-	scanner := bufio.NewScanner(bufio.NewReader(file))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if commentStart := strings.Index(line, "#"); commentStart >= 0 {
-			line = line[0:commentStart]
-		}
-		if line = strings.TrimSpace(line); line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-
-		if len(fields) == 1 && trashConf.Package == "" {
-			trashConf.Package = fields[0] // use the first 1-field line as the root package
-			logrus.Infof("Using '%s' as the project's root package (from %s)", trashConf.Package, trashConf.confFile)
-			continue
-		}
-		// If we have a `-` suffix, it's an exclude pattern
-		if fields[0][0] == '-' {
-			trashConf.Excludes = append(trashConf.Excludes, strings.TrimSpace(fields[0][1:]))
-			continue
-		}
-
-		// Otherwise it's an import pattern
-		packageImport := Import{}
-		packageImport.Package = fields[0] // at least 1 field at this point: trimmed the line and skipped empty
-		if len(fields) > 3 {
-			packageImport.Options = parseOptions(fields[3])
-		}
-		if len(fields) > 2 {
-			if strings.Contains(fields[2], "=") {
-				packageImport.Options = parseOptions(fields[2])
-			} else {
-				packageImport.Repo = fields[2]
-			}
-		}
-		if len(fields) > 1 {
-			packageImport.Version = fields[1]
-		}
-		trashConf.Imports = append(trashConf.Imports, packageImport)
-	}
-
+	trashConf.yamlType = true
 	trashConf.Dedupe()
+	if len(trashConf.IgnoredTags) == 0 {
+		trashConf.IgnoredTags = []string{"ignore"}
+	} else {
+		trashConf.IgnoredTags = append(trashConf.IgnoredTags, "ignore")
+	}
+	trashConf.IgnoredTags = strUnique(trashConf.IgnoredTags)
+
+	for i, s := range trashConf.IgnoredPkgs {
+		trashConf.IgnoredPkgs[i] = strings.Trim(s, "/")
+	}
 	return trashConf, nil
 }
 
-// Other options besides include_transitive can be included in the future
-func parseOptions(options string) Options {
-	var importOptions Options
-	parts := strings.Split(options, ",")
-	for _, part := range parts {
-		kvParts := strings.Split(part, "=")
-		if len(kvParts) > 1 && kvParts[1] == "true" {
-			switch kvParts[0] {
-			case "transitive":
-				importOptions.Transitive = true
-			case "staging":
-				importOptions.Staging = true
-			}
+func strUnique(src []string) []string {
+	ret := []string{}
+	m := make(map[string]bool)
+	for _, s := range src {
+		if !m[s] {
+			m[s] = true
+			ret = append(ret, s)
 		}
 	}
-	return importOptions
+	return ret
 }
 
 // Dedupe deletes duplicates and sorts the imports
@@ -142,40 +101,19 @@ func (t *Conf) Get(pkg string) (Import, bool) {
 	return i, ok
 }
 
+func (t *Conf) ConfFile() string {
+	return t.confFile
+}
+
 func (t *Conf) Dump(path string) error {
-	file, err := os.Create(path)
+	fp, err := ioutil.TempFile("", "vndr")
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
-	// If a previous version was in yaml format, preserve it
-	if t.yamlType {
-		return yaml.NewEncoder(file).Encode(t)
+	if err := yaml.NewEncoder(fp).Encode(t); err != nil {
+		fp.Close()
+		return err
 	}
-	// Otherwise create a flat config file
-	w := bufio.NewWriter(file)
-	defer w.Flush()
-
-	fmt.Fprintln(w, "# package")
-	fmt.Fprintln(w, t.Package)
-
-	if len(t.Imports) > 0 {
-		fmt.Fprintln(w, "\n# import")
-		for _, i := range t.Imports {
-			s := fmt.Sprintf("%s\t%s\t%s", i.Package, i.Version, i.Repo)
-			fmt.Fprintln(w, strings.TrimSpace(s))
-		}
-	}
-	if len(t.Excludes) > 0 {
-		fmt.Fprintln(w, "\n# exclude")
-		for _, pkg := range t.Excludes {
-			fmt.Fprintln(w, "-"+strings.TrimSpace(pkg))
-		}
-	}
-	return nil
-}
-
-func (t *Conf) ConfFile() string {
-	return t.confFile
+	fp.Close()
+	return os.Rename(fp.Name(), path)
 }
