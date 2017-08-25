@@ -952,7 +952,8 @@ var (
 
 func isLicenseFile(f string) bool {
 	f = strings.ToLower(f)
-	if strings.Contains(f, "license") || strings.Contains(f, "notice") {
+	if strings.Contains(f, "license") || strings.Contains(f, "notice") ||
+		strings.Contains(f, "licence") || strings.Contains(f, "copy") {
 		return true
 	}
 	return false
