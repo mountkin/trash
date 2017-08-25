@@ -17,8 +17,8 @@ import (
 
 	"github.com/Masterminds/glide/godep"
 	"github.com/Sirupsen/logrus"
-	"github.com/rancher/trash/conf"
-	"github.com/rancher/trash/util"
+	"github.com/mountkin/trash/conf"
+	"github.com/mountkin/trash/util"
 	"github.com/urfave/cli"
 )
 
